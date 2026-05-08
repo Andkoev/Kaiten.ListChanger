@@ -1,100 +1,110 @@
 // ==UserScript==
 // @name         KaitenListChanger
-// @version      1.0
+// @version      1.1
 // @author       Андрей Кокорев
-// @description  Drag-and-drop полей карточки Kaiten с автообновлением и увеличенной шириной
-// @match        https://kaiten.*.tech/*
+// @description  Drag-and-drop для полей карточки Kaiten с сохранением порядка
+// @match        https://kaiten.*/*
+// @require      https://cdn.jsdelivr.net/npm/sortablejs@1.15.0/Sortable.min.js
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @run-at       document-idle
 // ==/UserScript==
 
-// === НАЧАЛО СКРИПТА ===
 (function () {
     'use strict';
 
-    // Ключ для хранения порядка полей в localStorage
     const STORAGE_KEY = 'kaitenFieldOrder';
 
-    // Подгрузка библиотеки SortableJS для drag-and-drop функциональности
-    function loadSortable(callback) {
-        const script = document.createElement('script');
-        script.src = 'https://cdn.jsdelivr.net/npm/sortablejs@1.15.0/Sortable.min.js';
-        script.onload = callback;
-        document.head.appendChild(script);
-    }
-
-    // Получение блока карточки
     function getCardContent() {
         return document.querySelector('div.cardContent');
     }
 
-    // Поиск всех блоков с пользовательскими полями (основан на заголовках <h6>)
     function findFieldBlocks(cardContent) {
         const h6List = cardContent.querySelectorAll('h6');
         const used = new Set();
         const fields = [];
 
         h6List.forEach(h6 => {
-            // Поднимаемся по DOM-иерархии, чтобы найти контейнер всего поля
+            const title = h6.textContent.trim();
+            if (!title) return;
+
+            // Ищем ближайший div с классом на v4- (Kaiten Vue 4)
             let block = h6.closest('div[class^="v4-"]');
-            while (block && block.parentElement && block.parentElement !== cardContent && block.parentElement.querySelector('h6') === h6) {
-                block = block.parentElement;
+            if (!block) return;
+
+            // Поднимаемся по иерархии до прямого ребёнка cardContent,
+            // но останавливаемся, если родитель содержит другой заголовок h6
+            let container = block;
+            while (
+                container &&
+                container.parentElement &&
+                container.parentElement !== cardContent
+            ) {
+                const siblingH6 = container.parentElement.querySelector('h6');
+                if (siblingH6 && siblingH6 !== h6) break;
+                container = container.parentElement;
             }
 
-            // Исключаем повторения и добавляем класс для перетаскивания
-            if (block && !used.has(block)) {
-                used.add(block);
-                block.classList.add('kaiten-draggable');
-                fields.push({ name: h6.textContent.trim(), element: block });
-            }
+            if (!container || used.has(container)) return;
+
+            used.add(container);
+            container.classList.add('kaiten-draggable');
+            fields.push({ name: title, element: container });
         });
 
         return fields;
     }
 
-    // Сохраняем текущий порядок в localStorage
     function saveOrder(order) {
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(order));
+        GM_setValue(STORAGE_KEY, JSON.stringify(order));
     }
 
-    // Загружаем сохранённый порядок полей
     function loadOrder() {
-        return JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]');
+        try {
+            return JSON.parse(GM_getValue(STORAGE_KEY, '[]'));
+        } catch (e) {
+            console.warn('[Kaiten Sort] Не удалось загрузить порядок полей:', e);
+            return [];
+        }
     }
 
-    // Применяем сохранённый порядок к DOM
     function applyOrder(fields, savedOrder) {
         const parent = fields[0]?.element?.parentElement;
-        if (!parent) return;
+        if (!parent || !savedOrder || savedOrder.length === 0) return;
 
-        // Создаём карту с индексами сохранённых названий
         const orderMap = new Map(savedOrder.map((name, i) => [name, i]));
 
-        // Сортировка: сначала по сохранённому порядку, затем — оставшиеся
-        fields.sort((a, b) => {
+        // Клонируем массив, чтобы не мутировать оригинальный порядок аргументов
+        const sorted = [...fields].sort((a, b) => {
             const ai = orderMap.has(a.name) ? orderMap.get(a.name) : Infinity;
             const bi = orderMap.has(b.name) ? orderMap.get(b.name) : Infinity;
             return ai - bi;
         });
 
-        // Добавляем элементы обратно в контейнер в новом порядке
-        fields.forEach(f => parent.appendChild(f.element));
+        sorted.forEach(f => parent.appendChild(f.element));
     }
 
-    // Включаем drag-and-drop для полей
     function enableDrag(fields) {
         const parent = fields[0]?.element?.parentElement;
         if (!parent) return;
 
-        new Sortable(parent, {
+        // Уничтожаем предыдущий инстанс, если DOM переиспользуется
+        if (parent._kaitenSortable) {
+            parent._kaitenSortable.destroy();
+        }
+
+        parent._kaitenSortable = new Sortable(parent, {
             animation: 150,
             ghostClass: 'sortable-ghost',
             draggable: '.kaiten-draggable',
-            handle: 'h6', // перетаскивание по заголовку поля
+            handle: 'h6',
             onEnd: () => {
-                // При завершении перемещения сохраняем новый порядок
-                const newOrder = Array.from(parent.children).map(el => {
-                    const h = el.querySelector('h6');
-                    return h ? h.textContent.trim() : null;
-                }).filter(Boolean);
+                const newOrder = Array.from(parent.children)
+                    .map(el => {
+                        const h = el.querySelector('h6');
+                        return h ? h.textContent.trim() : null;
+                    })
+                    .filter(Boolean);
 
                 saveOrder(newOrder);
                 console.log('[Kaiten Sort] Новый порядок сохранён:', newOrder);
@@ -102,26 +112,25 @@
         });
     }
 
-    // Инициализация для текущей открытой карточки
     function initOnce() {
         const cardContent = getCardContent();
-        if (!cardContent || cardContent.dataset.kaitenSorted === '1') return;
+        if (!cardContent) return;
 
         const fields = findFieldBlocks(cardContent);
-const saved = loadOrder();
+        if (fields.length === 0) return;
 
+        const saved = loadOrder();
         applyOrder(fields, saved);
         enableDrag(fields);
 
-        // Ставим флаг, чтобы не инициализировать повторно
-        cardContent.dataset.kaitenSorted = '1';
         console.log('[Kaiten Sort] Инициализация завершена');
     }
 
-    // Наблюдаем за открытием карточек (динамическая загрузка через мутации)
     function observeCardOpen() {
+        let debounceTimer;
         const observer = new MutationObserver(() => {
-            initOnce(); // Пытаемся проинициализироваться при каждой мутации
+            clearTimeout(debounceTimer);
+            debounceTimer = setTimeout(initOnce, 250);
         });
 
         observer.observe(document.body, {
@@ -130,11 +139,7 @@ const saved = loadOrder();
         });
     }
 
-    // Загружаем SortableJS, затем инициализируем первый раз и включаем слежение
-    loadSortable(() => {
-        initOnce();         // Для первой карточки
-        observeCardOpen();  // Для всех следующих
-    });
+    // Запуск
+    initOnce();
+    observeCardOpen();
 })();
-
-// === КОНЕЦ СКРИПТА ===
